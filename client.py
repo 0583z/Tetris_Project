@@ -5,84 +5,76 @@ import threading
 import json
 import os
 
-# --- 1. 极致低延迟音频预配置 ---
 try:
     pygame.mixer.pre_init(44100, -16, 2, 512)
-except:
-    pass
+except: pass
 
-# --- 2. 全局常量与配色 ---
+# --- 全局配置与暗黑科技风色盘 ---
 WIDTH, HEIGHT = 1000, 700 
 GRID_SIZE = 30
 COLUMNS, ROWS = 10, 20
-BLOCK_COLOR, GRID_COLOR, BG_COLOR = (68, 80, 89), (50, 50, 60), (30, 30, 40)
+BLOCK_COLOR = (68, 80, 89)
+GRID_COLOR = (50, 50, 60)
+BG_COLOR = (30, 30, 40)
+PANEL_BG = (40, 40, 52)
 FLASH_COLOR = (255, 255, 255)
 SHAPES = [[[1,1,1,1]], [[1,1],[1,1]], [[0,1,0],[1,1,1]], [[1,1,0],[0,1,1]], [[0,1,1],[1,1,0]]]
-LOCAL_DB = "local_single_scores.json"
 
-app_state = {"local_single": [], "server_multi": [], "conn_status": "OFFLINE"}
+# 客户端全局核心大厅状态机
+# 状态机空间: LOGIN(登录框), LOBBY(好友大厅), SINGLE(单人游玩), MULTI(好友跨屏对战)
+lobby_data = {
+    "my_name": "",
+    "conn_status": "DISCONNECTED",  # DISCONNECTED, CONNECTING, VERIFYING, LOBBY
+    "err_msg": "",
+    "friends": {},        # 结构: {"好友名": "online"/"offline"}
+    "requests": [],       # 收到的好友请求
+    "active_toast": "",
+    "toast_timer": 0,
+    "incoming_invite": None, # 接收到的对战申请，结构: "发件人名字"
+    "opponent_name": ""
+}
 
-# --- 3. 音效控制器 (加入进阶机制) ---
+# --- 智能声效反馈引擎 ---
 class SoundController:
     def __init__(self):
         self.base_path = os.path.dirname(os.path.abspath(__file__))
         self.sounds = {}
-        sfx_map = {
-            "move": "move.wav", 
-            "rotate": "rotate.wav", 
-            "drop": "drop.wav", 
-            "clear": "clear.wav", 
-            "attack": "attack.wav", 
-            "over": "gameover.wav"
-        }
+        sfx_map = {"move": "move.wav", "rotate": "rotate.wav", "drop": "drop.wav", 
+                   "clear": "clear.wav", "attack": "attack.wav", "over": "gameover.wav"}
         for name, file in sfx_map.items():
             p = os.path.join(self.base_path, "assets", file)
             if os.path.exists(p): 
                 self.sounds[name] = pygame.mixer.Sound(p)
                 self.sounds[name].set_volume(0.4)
         
-        # 精准匹配你的文件名
         self.bgm_normal = os.path.join(self.base_path, "assets", "resonance.wav")
         self.bgm_fast = os.path.join(self.base_path, "assets", "fast_resonance.wav")
-        
-        self.bgm_state = "normal"  # 状态机：normal 或 fast
-        self.bgm_playing = False
-        
-        # 移动音效节流阀（防止长按爆音）
+        self.bgm_state, self.bgm_playing = "normal", False
         self.last_move_time = 0
 
     def play(self, name):
         if name in self.sounds: 
-            # 恢复默认音量（防止被 Combo 调大后影响后续）
             if name == "clear": self.sounds[name].set_volume(0.4)
             self.sounds[name].play()
 
     def play_move(self):
-        """长按节流版移动音效"""
         now = pygame.time.get_ticks()
-        if now - self.last_move_time > 100:  # 冷却时间 100ms
-            if "move" in self.sounds:
-                self.sounds["move"].play()
+        if now - self.last_move_time > 100:
+            if "move" in self.sounds: self.sounds["move"].play()
             self.last_move_time = now
 
     def play_clear(self, combo):
-        """连击动态扩音系统"""
         if "clear" in self.sounds:
             snd = self.sounds["clear"]
-            # 基础音量 0.4，每次连击增加 0.2，最高 1.0 (满共鸣)
-            vol = min(1.0, 0.4 + (combo - 1) * 0.2)
-            snd.set_volume(vol)
+            snd.set_volume(min(1.0, 0.4 + (combo - 1) * 0.2))
             snd.play()
 
     def set_danger_bgm(self, is_danger):
-        """动态 BGM 切换引擎"""
         target_state = "fast" if is_danger else "normal"
         target_path = self.bgm_fast if is_danger else self.bgm_normal
-        
         if self.bgm_state != target_state:
             self.bgm_state = target_state
             if os.path.exists(target_path):
-                # 0.5秒淡出现在的，然后立刻切入新的
                 pygame.mixer.music.fadeout(500)
                 pygame.mixer.music.load(target_path)
                 pygame.mixer.music.set_volume(0.4 if is_danger else 0.3)
@@ -97,47 +89,30 @@ class SoundController:
                 self.bgm_playing = True
             except: pass
 
-# --- 4. 辅助工具 ---
 def get_font(size):
     p = ["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf"]
     for f in p:
         if os.path.exists(f): return pygame.font.Font(f, size)
     return pygame.font.Font(None, size)
 
-def load_local_scores():
-    if os.path.exists(LOCAL_DB):
-        try:
-            with open(LOCAL_DB, "r") as f: return json.load(f)
-        except: return []
-    return []
+def trigger_toast(msg):
+    lobby_data["active_toast"] = msg
+    lobby_data["toast_timer"] = 60 # 2秒展示
 
-def save_local_score(name, score):
-    scores = load_local_scores()
-    scores.append({"name": name, "score": score})
-    scores = sorted(scores, key=lambda x: x["score"], reverse=True)[:100]
-    with open(LOCAL_DB, "w") as f: json.dump(scores, f)
-    app_state["local_single"] = scores
-
-# --- 5. 核心游戏引擎 ---
+# --- 核心游戏物理沙盒 ---
 class Tetris:
-    def __init__(self, mode="single", sock=None, sfx=None):
-        self.mode, self.socket, self.sfx = mode, sock, sfx
+    def __init__(self, mode="single", sock=None, sfx=None, opponent=""):
+        self.mode, self.socket, self.sfx, self.opponent = mode, sock, sfx, opponent
         self.grid = [[0] * COLUMNS for _ in range(ROWS)]
         self.opponent_grid = [[0] * COLUMNS for _ in range(ROWS)]
         self.bag = []
         self.current_piece = self._get_from_bag()
         self.next_piece = self._get_from_bag()
         self.pos = [0, COLUMNS // 2 - 1]
-        self.game_over = False
-        self.score, self.score_submitted = 0, False
         
-        self.total_lines = 0
-        self.level = 1
-        self.flashing_rows = []
-        self.flash_timer = 0 
-        
-        # 连击计数器
-        self.combo_count = 0
+        self.game_over, self.opponent_game_over = False, False
+        self.score, self.total_lines, self.level = 0, 0, 1
+        self.flashing_rows, self.flash_timer, self.combo_count = [], 0, 0
 
     def _get_from_bag(self):
         if not self.bag: self.bag = list(range(len(SHAPES))); random.shuffle(self.bag)
@@ -164,13 +139,12 @@ class Tetris:
         if self.sfx: self.sfx.play("drop")
         
         self.flashing_rows = [i for i, row in enumerate(self.grid) if all(row)]
-        
         if self.flashing_rows:
             self.flash_timer = 6
             self.combo_count += 1
             if self.sfx: self.sfx.play_clear(self.combo_count)
         else:
-            self.combo_count = 0 # 未消行，连击中断
+            self.combo_count = 0
             self.spawn_next()
 
     def finalize_clear(self):
@@ -181,20 +155,20 @@ class Tetris:
         
         self.total_lines += cleared
         self.level = 1 + (self.total_lines // 10)
-        # 连击分数加成
         self.score += (cleared ** 2) * 100 * self.combo_count 
         
         if self.mode == "multi" and self.socket and cleared >= 2:
             atk = {2:1, 3:2, 4:4}.get(cleared, 0)
             if atk > 0:
                 if self.sfx: self.sfx.play("attack")
-                try: self.socket.sendall((json.dumps({"type":"attack","lines":atk})+"\n").encode())
+                try:
+                    pkg = json.dumps({"type": "attack", "target": self.opponent, "lines": atk}) + "\n"
+                    self.socket.sendall(pkg.encode('utf-8'))
                 except: pass
         self.flashing_rows = []
         self.spawn_next()
 
     def spawn_next(self):
-        # 扫描前 5 行，只要有方块就触发危机场 BGM
         danger = any(self.grid[r][c] for r in range(5) for c in range(COLUMNS))
         if self.sfx: self.sfx.set_danger_bgm(danger)
 
@@ -210,16 +184,12 @@ class Tetris:
             new_row = [1] * COLUMNS
             new_row[random.randint(0, COLUMNS-1)] = 0
             self.grid.append(new_row)
-        # 如果收到大量垃圾行，可能直接进入危险状态
         danger = any(self.grid[r][c] for r in range(5) for c in range(COLUMNS))
         if self.sfx: self.sfx.set_danger_bgm(danger)
 
     def draw_grid(self, screen, grid, offset_x, title, is_opponent=False):
-        # 加入连击数 UI 显示
         header = f"{title} | LV.{self.level} | 得分:{self.score}"
-        if not is_opponent and self.combo_count > 1:
-            header += f" | Combo x{self.combo_count}!"
-        
+        if not is_opponent and self.combo_count > 1: header += f" | Combo x{self.combo_count}!"
         screen.blit(get_font(24).render(header if not is_opponent else title, True, (255,255,255)), (offset_x, 15))
         
         for r in range(ROWS):
@@ -238,159 +208,397 @@ class Tetris:
                         py = 50 + (self.pos[0] + r_idx) * GRID_SIZE
                         pygame.draw.rect(screen, BLOCK_COLOR, pygame.Rect(px, py, GRID_SIZE, GRID_SIZE).inflate(-2,-2), border_radius=4)
 
-        px_x = offset_x + COLUMNS * GRID_SIZE + 20
-        screen.blit(get_font(20).render("下一个", True, (150,150,150)), (px_x, 50))
-        p = self.next_piece if not is_opponent else None
-        if p:
-            for r_idx, row in enumerate(p):
-                for c_idx, val in enumerate(row):
-                    if val: pygame.draw.rect(screen, BLOCK_COLOR, pygame.Rect(px_x + c_idx*20, 80 + r_idx*20, 18, 18), border_radius=3)
-
-# --- 6. 通信与 UI ---
-def receive_data(sock, game):
+# --- 异步全局网络网关 ---
+def network_listener(sock, game_engine_ref_box):
     buffer = ""
+    global current_state
     while True:
         try:
-            data = sock.recv(4096).decode()
+            data = sock.recv(4096).decode('utf-8')
             if not data: break
             buffer += data
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                if line.strip():
-                    msg = json.loads(line)
-                    if msg.get("type") == "leaderboard_data": app_state["server_multi"] = msg.get("data", {}).get("multi", [])
-                    elif msg.get("type") == "game_data": game.opponent_grid = msg.get("grid")
-                    elif msg.get("type") == "be_attacked": game.add_garbage(msg.get("lines"))
+                if not line.strip(): continue
+                msg = json.loads(line)
+                m_type = msg.get("type")
+                
+                if m_type == "login_resp":
+                    if msg.get("success"):
+                        lobby_data["my_name"] = msg.get("username")
+                        lobby_data["friends"] = msg.get("friends", {})
+                        lobby_data["requests"] = msg.get("requests", [])
+                        lobby_data["conn_status"] = "LOBBY"
+                    else:
+                        lobby_data["err_msg"] = msg.get("reason", "验证失败")
+                        lobby_data["conn_status"] = "DISCONNECTED"
+                        
+                elif m_type == "toast":
+                    trigger_toast(msg.get("msg", ""))
+                    
+                elif m_type == "friend_status":
+                    user = msg.get("username")
+                    stat = msg.get("status")
+                    if user in lobby_data["friends"]:
+                        lobby_data["friends"][user] = stat
+                        
+                elif m_type == "new_request":
+                    lobby_data["requests"].append(msg.get("from"))
+                    trigger_toast(f"🔔 收到来自 {msg.get('from')} 的好友申请")
+                    
+                elif m_type == "sync_requests":
+                    lobby_data["requests"] = msg.get("requests", [])
+                    
+                elif m_type == "friend_added":
+                    user = msg.get("username")
+                    stat = msg.get("status", "offline")
+                    lobby_data["friends"][user] = stat
+                    if "sync_requests" in msg:
+                        lobby_data["requests"] = msg.get("sync_requests")
+                    trigger_toast(f"🎉 已和 {user} 成功建立好友关系！")
+                    
+                elif m_type == "invite_received":
+                    lobby_data["incoming_invite"] = msg.get("from")
+                    
+                elif m_type == "match_start":
+                    opp = msg.get("opponent")
+                    lobby_data["opponent_name"] = opp
+                    # 激活实例化新对战模块句柄
+                    game_engine_ref_box[0] = Tetris("multi", sock, None, opp) 
+                    game_engine_ref_box[1] = True # 标记进入状态切换
+                    
+                elif m_type == "game_data":
+                    if game_engine_ref_box[0]:
+                        game_engine_ref_box[0].opponent_grid = msg.get("grid")
+                        if "game_over" in msg:
+                            game_engine_ref_box[0].opponent_game_over = msg.get("game_over")
+                            
+                elif m_type == "attack":
+                    if game_engine_ref_box[0]:
+                        game_engine_ref_box[0].add_garbage(msg.get("lines"))
         except: break
 
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("俄罗斯方块：心流反馈引擎")
+    pygame.display.set_caption("俄罗斯方块：好友邀请对战版")
     clock = pygame.time.Clock()
-    
-    # 你最爱的长按连发已就位！
     pygame.key.set_repeat(150, 50)
     
     sfx = SoundController()
     sfx.start_bgm()
     
-    state, player_name, server_ip = "MENU", "", "127.0.0.1"
-    active_input, client_socket = None, None
-    game = Tetris(sfx=sfx)
-    app_state["local_single"] = load_local_scores()
-
-    name_rect = pygame.Rect(WIDTH//2 - 150, 180, 300, 50)
-    ip_rect =   pygame.Rect(WIDTH//2 - 150, 250, 300, 50)
-    btn_single = pygame.Rect(WIDTH//2 - 150, 330, 300, 50)
-    btn_multi =  pygame.Rect(WIDTH//2 - 150, 400, 300, 50)
-    btn_board =  pygame.Rect(WIDTH//2 - 150, 470, 300, 50)
-    btn_back =   pygame.Rect(WIDTH//2 - 100, 620, 200, 50)
-
-    def try_connect():
-        nonlocal client_socket
-        if client_socket: return True
-        try:
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.settimeout(1.5); client_socket.connect((server_ip, 5555))
-            threading.Thread(target=receive_data, args=(client_socket, game), daemon=True).start()
-            app_state["conn_status"] = "ONLINE"
-            return True
-        except:
-            client_socket = None; app_state["conn_status"] = "OFFLINE"
-            return False
-
+    # 状态标记
+    state = "LOGIN"
+    input_name = ""
+    input_ip = "127.0.0.1"
+    input_add_friend = ""
+    active_field = "NAME" # NAME, IP, FRIEND_BOX
+    
+    client_socket = None
+    # 拳头包装引用盒，用于在线程内修改外部游玩引擎
+    game_box = [None, False] 
+    
+    # 静态UI按钮区域计算
+    field_name_rect = pygame.Rect(WIDTH//2 - 150, 220, 300, 45)
+    field_ip_rect =   pygame.Rect(WIDTH//2 - 150, 290, 300, 45)
+    btn_login_rect =  pygame.Rect(WIDTH//2 - 150, 360, 300, 50)
+    
+    btn_single_rect = pygame.Rect(80, 150, 260, 50)
+    field_add_rect =  pygame.Rect(80, 290, 260, 45)
+    btn_add_rect =    pygame.Rect(80, 350, 260, 45)
+    
+    btn_return_game = pygame.Rect(WIDTH - 160, 20, 140, 40)
+    
     fall_time = 0
+    
     while True:
-        screen.fill(BG_COLOR); dt = clock.tick(30); fall_time += dt
-        current_speed = max(100, 450 - (game.level * 40))
+        screen.fill(BG_COLOR)
+        dt = clock.tick(30)
+        fall_time += dt
+        
+        # 吐司消息计时器衰减
+        if lobby_data["toast_timer"] > 0:
+            lobby_data["toast_timer"] -= 1
+            if lobby_data["toast_timer"] == 0: lobby_data["active_toast"] = ""
 
+        # 检测线程中介是否要求强制开启对战状态
+        if game_box[1]:
+            game_box[1] = False
+            # 剥离并传入声效控制器
+            game_box[0].sfx = sfx
+            state = "MULTI"
+
+        current_speed = max(100, 450 - (game_box[0].level * 40)) if game_box[0] else 450
+
+        # --- 事件驱动总线 ---
         for event in pygame.event.get():
-            if event.type == pygame.QUIT: pygame.quit(); return
-            if state == "MENU":
-                if event.type == pygame.MOUSEBUTTONDOWN:
-                    if name_rect.collidepoint(event.pos): active_input = "NAME"
-                    elif ip_rect.collidepoint(event.pos): active_input = "IP"
-                    else: active_input = None
-                    if btn_single.collidepoint(event.pos) and player_name:
-                        game = Tetris("single", sfx=sfx); state = "SINGLE"
-                    elif btn_multi.collidepoint(event.pos) and player_name:
-                        if try_connect(): game = Tetris("multi", client_socket, sfx); state = "MULTI"
-                    elif btn_board.collidepoint(event.pos):
-                        try_connect()
-                        if client_socket: client_socket.sendall(json.dumps({"type":"get_leaderboard"}).encode()+b"\n")
-                        state = "LEADERBOARD"
-                if event.type == pygame.KEYDOWN and active_input:
-                    if event.key == pygame.K_BACKSPACE:
-                        if active_input == "NAME": player_name = player_name[:-1]
-                        else: server_ip = server_ip[:-1]
-                    elif event.unicode.isprintable():
-                        if active_input == "NAME": player_name += event.unicode
-                        else: server_ip += event.unicode
-            elif state == "LEADERBOARD":
-                if (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE) or \
-                   (event.type == pygame.MOUSEBUTTONDOWN and btn_back.collidepoint(event.pos)): state = "MENU"
-            elif state in ["SINGLE", "MULTI"]:
-                if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE: state = "MENU"
-                    elif not game.game_over and game.flash_timer == 0:
-                        # 重点：修改为调用 play_move()，享受节流连音
-                        if event.key == pygame.K_LEFT and not game.check_collision(offset_c=-1): 
-                            game.pos[1] -= 1; sfx.play_move()
-                        elif event.key == pygame.K_RIGHT and not game.check_collision(offset_c=1): 
-                            game.pos[1] += 1; sfx.play_move()
-                        elif event.key == pygame.K_DOWN and not game.check_collision(offset_r=1): 
-                            game.pos[0] += 1; sfx.play_move()
-                        elif event.key == pygame.K_UP: 
-                            game.rotate_piece(); sfx.play("rotate")
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return
+                
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if state == "LOGIN":
+                    if field_name_rect.collidepoint(event.pos): active_field = "NAME"
+                    elif field_ip_rect.collidepoint(event.pos): active_field = "IP"
+                    elif btn_login_rect.collidepoint(event.pos) and input_name.strip():
+                        # 发起全局网络握手
+                        lobby_data["conn_status"] = "CONNECTING"
+                        try:
+                            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            client_socket.settimeout(2.0)
+                            client_socket.connect((input_ip, 5555))
+                            client_socket.settimeout(None)
+                            
+                            lobby_data["conn_status"] = "VERIFYING"
+                            # 开启后台接收监听管道
+                            threading.Thread(target=network_listener, args=(client_socket, game_box), daemon=True).start()
+                            # 发送登录报文
+                            pkg = json.dumps({"type": "login", "username": input_name.strip()}) + "\n"
+                            client_socket.sendall(pkg.encode('utf-8'))
+                            state = "LOBBY"
+                        except Exception as e:
+                            client_socket = None
+                            lobby_data["conn_status"] = "DISCONNECTED"
+                            lobby_data["err_msg"] = "连接服务器失败，请检查IP"
+                            
+                elif state == "LOBBY":
+                    if field_add_rect.collidepoint(event.pos): active_field = "FRIEND_BOX"
+                    else: active_field = None
+                    
+                    # 1. 触发单人快玩
+                    if btn_single_rect.collidepoint(event.pos):
+                        game_box[0] = Tetris("single", None, sfx)
+                        state = "SINGLE"
+                        
+                    # 2. 触发添加好友请求
+                    elif btn_add_rect.collidepoint(event.pos) and input_add_friend.strip():
+                        if client_socket:
+                            pkg = json.dumps({"type": "add_friend", "target": input_add_friend.strip()}) + "\n"
+                            client_socket.sendall(pkg.encode('utf-8'))
+                            input_add_friend = ""
+                            
+                    # 3. 实时循环遍历好友列表按钮（点击邀请）
+                    y_offset = 150
+                    for f_name, f_stat in list(lobby_data["friends"].items()):
+                        if f_stat == "online":
+                            invite_btn = pygame.Rect(WIDTH - 230, y_offset - 2, 80, 32)
+                            if invite_btn.collidepoint(event.pos):
+                                pkg = json.dumps({"type": "invite_friend", "target": f_name}) + "\n"
+                                client_socket.sendall(pkg.encode('utf-8'))
+                                trigger_toast(f"✉️ 已向 {f_name} 发出对战请求")
+                        y_offset += 45
+                        
+                    # 4. 实时遍历处理收到的好友申请 (同意/拒绝)
+                    req_y = 480
+                    for req_user in list(lobby_data["requests"][:3]):
+                        btn_acc = pygame.Rect(210, req_y - 2, 60, 30)
+                        btn_rej = pygame.Rect(280, req_y - 2, 60, 30)
+                        if btn_acc.collidepoint(event.pos):
+                            pkg = json.dumps({"type": "accept_friend", "from": req_user}) + "\n"
+                            client_socket.sendall(pkg.encode('utf-8'))
+                        elif btn_rej.collidepoint(event.pos):
+                            pkg = json.dumps({"type": "reject_friend", "from": req_user}) + "\n"
+                            client_socket.sendall(pkg.encode('utf-8'))
+                        req_y += 40
+                        
+                    # 5. 弹出弹窗邀请机制处理 (如果存在邀请弹窗)
+                    if lobby_data["incoming_invite"]:
+                        box_acc = pygame.Rect(WIDTH//2 - 130, HEIGHT//2 + 20, 100, 40)
+                        box_rej = pygame.Rect(WIDTH//2 + 30, HEIGHT//2 + 20, 100, 40)
+                        if box_acc.collidepoint(event.pos):
+                            pkg = json.dumps({"type": "accept_invite", "from": lobby_data["incoming_invite"]}) + "\n"
+                            client_socket.sendall(pkg.encode('utf-8'))
+                            lobby_data["incoming_invite"] = None
+                        elif box_rej.collidepoint(event.pos):
+                            pkg = json.dumps({"type": "reject_invite", "from": lobby_data["incoming_invite"]}) + "\n"
+                            client_socket.sendall(pkg.encode('utf-8'))
+                            lobby_data["incoming_invite"] = None
+                            
+                elif state in ["SINGLE", "MULTI"]:
+                    if btn_return_game.collidepoint(event.pos):
+                        state = "LOBBY" if client_socket else "LOGIN"
+                        sfx.set_danger_bgm(False)
+                        game_box[0] = None
 
-        if state in ["SINGLE", "MULTI"] and not game.game_over:
-            if game.flash_timer > 0:
-                game.flash_timer -= 1
-                if game.flash_timer == 0: game.finalize_clear()
-            else:
-                if fall_time > current_speed:
-                    fall_time = 0
-                    if not game.check_collision(offset_r=1): game.pos[0] += 1
-                    else: game.lock_piece()
+            if event.type == pygame.KEYDOWN:
+                if state == "LOGIN":
+                    if event.key == pygame.K_BACKSPACE:
+                        if active_field == "NAME": input_name = input_name[:-1]
+                        elif active_field == "IP": input_ip = input_ip[:-1]
+                    elif event.unicode.isprintable():
+                        if active_field == "NAME" and len(input_name) < 12: input_name += event.unicode
+                        elif active_field == "IP": input_ip += event.unicode
+                elif state == "LOBBY":
+                    if active_field == "FRIEND_BOX":
+                        if event.key == pygame.K_BACKSPACE: input_add_friend = input_add_friend[:-1]
+                        elif event.unicode.isprintable() and len(input_add_friend) < 12: input_add_friend += event.unicode
+                elif state in ["SINGLE", "MULTI"]:
+                    if event.key == pygame.K_ESCAPE:
+                        state = "LOBBY" if client_socket else "LOGIN"
+                        sfx.set_danger_bgm(False)
+                        game_box[0] = None
+                    elif game_box[0] and not game_box[0].game_over and not game_box[0].opponent_game_over and game_box[0].flash_timer == 0:
+                        g = game_box[0]
+                        if event.key == pygame.K_LEFT and not g.check_collision(offset_c=-1): g.pos[1] -= 1; sfx.play_move()
+                        elif event.key == pygame.K_RIGHT and not g.check_collision(offset_c=1): g.pos[1] += 1; sfx.play_move()
+                        elif event.key == pygame.K_DOWN and not g.check_collision(offset_r=1): g.pos[0] += 1; sfx.play_move()
+                        elif event.key == pygame.K_UP: g.rotate_piece(); sfx.play("rotate")
+
+        # --- 状态物理循环帧渲染与格斗时钟更新 ---
+        if state in ["SINGLE", "MULTI"] and game_box[0]:
+            g = game_box[0]
+            if not g.game_over and not g.opponent_game_over:
+                if g.flash_timer > 0:
+                    g.flash_timer -= 1
+                    if g.flash_timer == 0: g.finalize_clear()
+                else:
+                    if fall_time > current_speed:
+                        fall_time = 0
+                        if not g.check_collision(offset_r=1): g.pos[0] += 1
+                        else: g.lock_piece()
+            
+            # 实时数据广播同步
             if state == "MULTI" and client_socket:
                 try:
-                    temp = [list(row) for row in game.grid]
-                    if not game.game_over:
-                        for r, row in enumerate(game.current_piece):
+                    temp = [list(row) for row in g.grid]
+                    if not g.game_over:
+                        for r, row in enumerate(g.current_piece):
                             for c, v in enumerate(row):
-                                if v and 0<=game.pos[0]+r<ROWS and 0<=game.pos[1]+c<COLUMNS: temp[game.pos[0]+r][game.pos[1]+c]=1
-                    client_socket.sendall((json.dumps({"type":"game_data","grid":temp})+"\n").encode())
+                                if v and 0<=g.pos[0]+r<ROWS and 0<=g.pos[1]+c<COLUMNS: temp[g.pos[0]+r][g.pos[1]+c]=1
+                    pkg = json.dumps({"type": "game_data", "target": g.opponent, "grid": temp, "game_over": g.game_over}) + "\n"
+                    client_socket.sendall(pkg.encode('utf-8'))
                 except: pass
-            if game.game_over and not game.score_submitted:
-                if state == "SINGLE": save_local_score(player_name, game.score)
-                elif client_socket: client_socket.sendall((json.dumps({"type":"submit_score","mode":"multi","name":player_name,"score":game.score})+"\n").encode())
-                game.score_submitted = True
 
-        if state == "MENU":
-            screen.blit(get_font(80).render("俄罗斯方块", True, (200,200,200)), (WIDTH//2-200, 60))
-            pygame.draw.rect(screen, (100,150,255) if active_input=="NAME" else GRID_COLOR, name_rect, 2)
-            screen.blit(get_font(24).render(f"昵称: {player_name}", True, (255,255,255)), (name_rect.x+10, name_rect.y+10))
-            pygame.draw.rect(screen, (100,150,255) if active_input=="IP" else GRID_COLOR, ip_rect, 2)
-            screen.blit(get_font(24).render(f"服务IP: {server_ip}", True, (255,255,255)), (ip_rect.x+10, ip_rect.y+10))
-            for b, t in [(btn_single, "单人模式"), (btn_multi, "双人对战"), (btn_board, "排行榜")]:
-                pygame.draw.rect(screen, BLOCK_COLOR, b, border_radius=5)
-                screen.blit(get_font(30).render(t, True, (255,255,255)), (b.x+90, b.y+8))
-        elif state == "LEADERBOARD":
-            screen.blit(get_font(50).render("排 行 榜", True, (200,200,200)), (WIDTH//2-70, 50))
-            app_state["local_single"] = load_local_scores()
-            for i, e in enumerate(app_state["local_single"][:12]):
-                screen.blit(get_font(26).render(f"{i+1}. {e['name']} - {e['score']}", True, (255,255,255)), (150, 160+i*35))
-            for i, e in enumerate(app_state["server_multi"][:12]):
-                screen.blit(get_font(26).render(f"{i+1}. {e['name']} - {e['score']}", True, (255,255,255)), (600, 160+i*35))
-            pygame.draw.rect(screen, BLOCK_COLOR, btn_back, border_radius=5)
-            screen.blit(get_font(30).render("返回菜单", True, (255,255,255)), (btn_back.x+40, btn_back.y+8))
-        elif state in ["SINGLE", "MULTI"]:
-            game.draw_grid(screen, game.grid, 50, player_name)
-            if state == "MULTI": game.draw_grid(screen, game.opponent_grid, 550, "对手", True)
-            if game.game_over:
-                txt = get_font(80).render("GAME OVER", True, (255,50,50))
-                screen.blit(txt, (WIDTH//2-200, HEIGHT//2-50))
+        # --- UI界面宏观绘制层 ---
+        if state == "LOGIN":
+            screen.blit(get_font(70).render("俄罗斯方块", True, (220,220,230)), (WIDTH//2 - 175, 80))
+            
+            # 绘制输入输入框框
+            pygame.draw.rect(screen, (100,150,255) if active_field=="NAME" else GRID_COLOR, field_name_rect, 2, border_radius=4)
+            screen.blit(get_font(20).render(f"注册独立用户名: {input_name}", True, (255,255,255)), (field_name_rect.x+12, field_name_rect.y+10))
+            
+            pygame.draw.rect(screen, (100,150,255) if active_field=="IP" else GRID_COLOR, field_ip_rect, 2, border_radius=4)
+            screen.blit(get_font(20).render(f"对战主机IP: {input_ip}", True, (255,255,255)), (field_ip_rect.x+12, field_ip_rect.y+10))
+            
+            pygame.draw.rect(screen, BLOCK_COLOR, btn_login_rect, border_radius=6)
+            screen.blit(get_font(24).render("进入游戏大厅", True, (255,255,255)), (btn_login_rect.x+75, btn_login_rect.y+10))
+            
+            if lobby_data["err_msg"]:
+                screen.blit(get_font(18).render(lobby_data["err_msg"], True, (255,70,70)), (WIDTH//2 - 130, 430))
+                
+        elif state == "LOBBY":
+            # 1. 顶部身份状态面板
+            pygame.draw.rect(screen, PANEL_BG, pygame.Rect(40, 30, WIDTH - 80, 80), border_radius=8)
+            screen.blit(get_font(26).render(f"🏆 欢迎来到竞技大厅 : {lobby_data['my_name']}", True, (100,255,150)), (60, 52))
+            
+            # 2. 左侧核心面板（单人快速开局，增加好友申请）
+            pygame.draw.rect(screen, PANEL_BG, pygame.Rect(40, 130, 340, 530), border_radius=8)
+            
+            pygame.draw.rect(screen, (80, 100, 120), btn_single_rect, border_radius=5)
+            screen.blit(get_font(22).render("🕹️ 单人模式 (极速快玩)", True, (255,255,255)), (btn_single_rect.x+20, btn_single_rect.y+10))
+            
+            # 分割线
+            pygame.draw.line(screen, GRID_COLOR, (60, 230), (360, 230), 2)
+            
+            screen.blit(get_font(20).render("➕ 扩充我的朋友圈", True, (200,200,220)), (60, 250))
+            pygame.draw.rect(screen, (100,150,255) if active_field=="FRIEND_BOX" else GRID_COLOR, field_add_rect, 2, border_radius=4)
+            screen.blit(get_font(18).render(input_add_friend if input_add_friend else "输入好友ID...", True, (255,255,255) if input_add_friend else (120,120,130)), (field_add_rect.x+10, field_add_rect.y+10))
+            
+            pygame.draw.rect(screen, (60, 140, 90) if input_add_friend.strip() else (60,70,65), btn_add_rect, border_radius=5)
+            screen.blit(get_font(20).render("发送好友申请", True, (255,255,255)), (btn_add_rect.x+70, btn_add_rect.y+10))
+            
+            # 好友申请专区
+            screen.blit(get_font(20).render("📥 收到的好友申请", True, (200,200,220)), (60, 440))
+            if not lobby_data["requests"]:
+                screen.blit(get_font(16).render("暂无申请", True, (120,120,130)), (60, 480))
+            else:
+                req_y = 480
+                for req_user in lobby_data["requests"][:3]:
+                    screen.blit(get_font(18).render(f"用户: {req_user}", True, (255,255,255)), (60, req_y))
+                    
+                    btn_acc = pygame.Rect(210, req_y - 2, 60, 30)
+                    pygame.draw.rect(screen, (40,150,80), btn_acc, border_radius=4)
+                    screen.blit(get_font(14).render("同意", True, (255,255,255)), (btn_acc.x+16, btn_acc.y+6))
+                    
+                    btn_rej = pygame.Rect(280, req_y - 2, 60, 30)
+                    pygame.draw.rect(screen, (180,60,60), btn_rej, border_radius=4)
+                    screen.blit(get_font(14).render("拒绝", True, (255,255,255)), (btn_rej.x+16, btn_rej.y+6))
+                    req_y += 40
+            
+            # 3. 右侧巨型好友花名册状态面板
+            pygame.draw.rect(screen, PANEL_BG, pygame.Rect(400, 130, WIDTH - 440, 530), border_radius=8)
+            screen.blit(get_font(22).render("👥 我的好友花名册", True, (220,220,240)), (430, 150))
+            
+            if not lobby_data["friends"]:
+                screen.blit(get_font(18).render("广袤人海，孤单一人。在左侧尝试添加好友吧！", True, (140,140,150)), (430, 220))
+            else:
+                y_offset = 200
+                for f_name, f_stat in list(lobby_data["friends"].items()):
+                    # 绘制好友昵称
+                    screen.blit(get_font(20).render(f_name, True, (255,255,255)), (430, y_offset))
+                    # 绘制在线彩灯指示器
+                    if f_stat == "online":
+                        pygame.draw.circle(screen, (50,255,100), (620, y_offset + 14), 7)
+                        screen.blit(get_font(16).render("在线", True, (50,255,100)), (635, y_offset + 4))
+                        
+                        # 呼叫对战按钮
+                        invite_btn = pygame.Rect(WIDTH - 230, y_offset - 2, 120, 32)
+                        pygame.draw.rect(screen, (130, 90, 200), invite_btn, border_radius=4)
+                        screen.blit(get_font(16).render("⚡ 邀请对战", True, (255,255,255)), (invite_btn.x+18, invite_btn.y+5))
+                    else:
+                        pygame.draw.circle(screen, (150,150,160), (620, y_offset + 14), 7)
+                        screen.blit(get_font(16).render("离线", True, (150,150,160)), (635, y_offset + 4))
+                    
+                    y_offset += 45
+
+            # 4. 终极邀请通知拦截器弹窗
+            if lobby_data["incoming_invite"]:
+                overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 200))
+                screen.blit(overlay, (0,0))
+                
+                popup = pygame.Rect(WIDTH//2 - 200, HEIGHT//2 - 100, 400, 200)
+                pygame.draw.rect(screen, PANEL_BG, popup, border_radius=12)
+                pygame.draw.rect(screen, (150,100,255), popup, 2, border_radius=12)
+                
+                txt = get_font(22).render(f"⚔️ 玩家 【{lobby_data['incoming_invite']}】 正在疯狂渴望与你决战！", True, (255,255,255))
+                screen.blit(txt, (WIDTH//2 - txt.get_width()//2, HEIGHT//2 - 50))
+                
+                box_acc = pygame.Rect(WIDTH//2 - 130, HEIGHT//2 + 20, 100, 40)
+                pygame.draw.rect(screen, (40,160,80), box_acc, border_radius=6)
+                screen.blit(get_font(18).render("迎战", True, (255,255,255)), (box_acc.x+32, box_acc.y+8))
+                
+                box_rej = pygame.Rect(WIDTH//2 + 30, HEIGHT//2 + 20, 100, 40)
+                pygame.draw.rect(screen, (180,60,60), box_rej, border_radius=6)
+                screen.blit(get_font(18).render("拒绝", True, (255,255,255)), (box_rej.x+32, box_rej.y+8))
+
+        elif state in ["SINGLE", "MULTI"] and game_box[0]:
+            g = game_box[0]
+            g.draw_grid(screen, g.grid, 50, lobby_data["my_name"] if lobby_data["my_name"] else "玩家")
+            if state == "MULTI":
+                g.draw_grid(screen, g.opponent_grid, 550, f"对手: {g.opponent}", True)
+            
+            # 渲染右上角返回大厅按钮
+            pygame.draw.rect(screen, BLOCK_COLOR, btn_return_game, border_radius=5)
+            screen.blit(get_font(22).render("返回大厅", True, (255,255,255)), (btn_return_game.x + 22, btn_return_game.y + 6))
+            
+            if g.game_over or g.opponent_game_over:
+                if state == "SINGLE": txt = get_font(80).render("GAME OVER", True, (255,50,50))
+                else:
+                    if g.game_over: txt = get_font(80).render("YOU LOSE!", True, (255,50,50))
+                    else: txt = get_font(80).render("YOU WIN!", True, (50,255,50))
+                screen.blit(txt, (WIDTH//2 - txt.get_width()//2, HEIGHT//2 - 50))
+
+        # 5. 全局系统飘字横幅 (Toast)
+        if lobby_data["active_toast"]:
+            t_surface = get_font(18).render(lobby_data["active_toast"], True, (255,255,255))
+            t_rect = pygame.Rect(WIDTH//2 - t_surface.get_width()//2 - 15, 20, t_surface.get_width() + 30, 40)
+            pygame.draw.rect(screen, (50,55,75), t_rect, border_radius=20)
+            pygame.draw.rect(screen, (100,180,255), t_rect, 1, border_radius=20)
+            screen.blit(t_surface, (WIDTH//2 - t_surface.get_width()//2, 28))
+
         pygame.display.flip()
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()

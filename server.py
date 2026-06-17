@@ -4,60 +4,215 @@ import json
 import os
 
 HOST, PORT = '0.0.0.0', 5555
-DB_FILE = 'server_leaderboard.json'
+DB_FILE = 'server_accounts.json'
 
-def load_board():
+# 全局内存数据库与在线会话追踪
+# online_players 结构: { "用户名": socket_conn }
+online_players = {}
+online_lock = threading.Lock()
+
+def load_db():
     if os.path.exists(DB_FILE):
-        with open(DB_FILE, 'r') as f: return json.load(f)
-    return {"single": [], "multi": []}
+        try:
+            with open(DB_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except: pass
+    return {}
 
-def save_board(data):
-    with open(DB_FILE, 'w') as f: json.dump(data, f)
+def save_db(data):
+    with open(DB_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
-def handle_client(conn, player_id, connections):
-    print(f"玩家 {player_id} 已连接")
+def broadcast_status_to_friends(username, status):
+    """通知所有在线好友该玩家的状态改变 (online / offline)"""
+    db = load_db()
+    if username in db:
+        friends = db[username].get("friends", [])
+        msg = json.dumps({"type": "friend_status", "username": username, "status": status}) + "\n"
+        with online_lock:
+            for f in friends:
+                if f in online_players:
+                    try: online_players[f].sendall(msg.encode('utf-8'))
+                    except: pass
+
+def handle_client(conn, addr):
+    my_username = None
     buffer = ""
+    print(f"📡 新的网络连接接入: {addr}")
+    
     while True:
         try:
-            data = conn.recv(4096).decode()
+            data = conn.recv(4096).decode('utf-8')
             if not data: break
             buffer += data
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
                 if not line.strip(): continue
                 msg = json.loads(line)
-                t, opp_id = msg.get("type"), 1 - player_id
-                opp_conn = connections[opp_id] if len(connections) > opp_id else None
+                m_type = msg.get("type")
+                
+                # --- 1. 登录/注册系统 ---
+                if m_type == "login":
+                    username = msg.get("username", "").strip()
+                    if not username:
+                        conn.sendall((json.dumps({"type": "login_resp", "success": False, "reason": "用户名不能为空"}) + "\n").encode('utf-8'))
+                        continue
+                    
+                    db = load_db()
+                    # 如果账号不存在则自动创建（极简无密码注册）
+                    if username not in db:
+                        db[username] = {"friends": [], "requests": []}
+                        save_db(db)
+                    
+                    with online_lock:
+                        if username in online_players:
+                            conn.sendall((json.dumps({"type": "login_resp", "success": False, "reason": "该账号已在别处登录"}) + "\n").encode('utf-8'))
+                            continue
+                        online_players[username] = conn
+                        my_username = username
+                    
+                    # 组装初始化数据大礼包
+                    friends_list = db[username].get("friends", [])
+                    # 判定每个好友当前的在线状态
+                    with online_lock:
+                        friends_status = {f: ("online" if f in online_players else "offline") for f in friends_list}
+                    
+                    resp = {
+                        "type": "login_resp",
+                        "success": True,
+                        "username": username,
+                        "friends": friends_status,
+                        "requests": db[username].get("requests", [])
+                    }
+                    conn.sendall((json.dumps(resp) + "\n").encode('utf-8'))
+                    
+                    # 广播给自己所有在线好友：我上线了
+                    broadcast_status_to_friends(username, "online")
+                
+                # --- 2. 添加好友申请 ---
+                elif m_type == "add_friend":
+                    target = msg.get("target", "").strip()
+                    if target == my_username:
+                        conn.sendall((json.dumps({"type": "toast", "msg": "不能添加自己为好友"}) + "\n").encode('utf-8'))
+                        continue
+                    
+                    db = load_db()
+                    if target not in db:
+                        conn.sendall((json.dumps({"type": "toast", "msg": f"玩家 {target} 不存在"}) + "\n").encode('utf-8'))
+                        continue
+                    
+                    if target in db[my_username].get("friends", []):
+                        conn.sendall((json.dumps({"type": "toast", "msg": f"你们已经是好友了"}) + "\n").encode('utf-8'))
+                        continue
+                        
+                    if my_username in db[target].get("requests", []):
+                        conn.sendall((json.dumps({"type": "toast", "msg": "已发送过申请，请勿重复发送"}) + "\n").encode('utf-8'))
+                        continue
+                    
+                    # 存入目标用户的申请列表
+                    db[target]["requests"].append(my_username)
+                    save_db(db)
+                    
+                    conn.sendall((json.dumps({"type": "toast", "msg": "好友申请已发出"}) + "\n").encode('utf-8'))
+                    
+                    # 如果目标用户在线，实时推送申请通知
+                    with online_lock:
+                        if target in online_players:
+                            online_players[target].sendall((json.dumps({"type": "new_request", "from": my_username}) + "\n").encode('utf-8'))
 
-                if t == "game_data" and opp_conn: opp_conn.sendall((line + "\n").encode())
-                elif t == "attack" and opp_conn:
-                    atk_pkg = json.dumps({"type": "be_attacked", "lines": msg.get("lines")}) + "\n"
-                    opp_conn.sendall(atk_pkg.encode())
-                elif t == "submit_score":
-                    board = load_board()
-                    m = msg.get("mode", "multi")
-                    board[m].append({"name": msg.get("name"), "score": msg.get("score")})
-                    board[m] = sorted(board[m], key=lambda x: x["score"], reverse=True)[:100]
-                    save_board(board)
-                elif t == "get_leaderboard":
-                    resp = json.dumps({"type": "leaderboard_data", "data": load_board()}) + "\n"
-                    conn.sendall(resp.encode())
-        except: break
-    if conn in connections: connections[player_id] = None
+                # --- 3. 同意好友申请 ---
+                elif m_type == "accept_friend":
+                    from_user = msg.get("from", "").strip()
+                    db = load_db()
+                    
+                    if from_user in db[my_username].get("requests", []):
+                        db[my_username]["requests"].remove(from_user)
+                        
+                        if from_user not in db[my_username]["friends"]:
+                            db[my_username]["friends"].append(from_user)
+                        if my_username not in db[from_user]["friends"]:
+                            db[from_user]["friends"].append(my_username)
+                        save_db(db)
+                        
+                        # 给自己发回最新好友列表状态
+                        with online_lock:
+                            my_status = "online" if my_username in online_players else "offline"
+                            from_status = "online" if from_user in online_players else "offline"
+                            
+                            # 给自己同步
+                            conn.sendall((json.dumps({"type": "friend_added", "username": from_user, "status": from_status, "sync_requests": db[my_username]["requests"]}) + "\n").encode('utf-8'))
+                            # 给对方同步
+                            if from_user in online_players:
+                                online_players[from_user].sendall((json.dumps({"type": "friend_added", "username": my_username, "status": my_status}) + "\n").encode('utf-8'))
+                
+                # --- 4. 拒绝好友申请 ---
+                elif m_type == "reject_friend":
+                    from_user = msg.get("from", "").strip()
+                    db = load_db()
+                    if from_user in db[my_username].get("requests", []):
+                        db[my_username]["requests"].remove(from_user)
+                        save_db(db)
+                        conn.sendall((json.dumps({"type": "sync_requests", "requests": db[my_username]["requests"]}) + "\n").encode('utf-8'))
+
+                # --- 5. 对战邀请路由系统 ---
+                elif m_type == "invite_friend":
+                    target = msg.get("target", "").strip()
+                    with online_lock:
+                        if target in online_players:
+                            online_players[target].sendall((json.dumps({"type": "invite_received", "from": my_username}) + "\n").encode('utf-8'))
+                        else:
+                            conn.sendall((json.dumps({"type": "toast", "msg": "该好友当前已下线"}) + "\n").encode('utf-8'))
+
+                # --- 6. 接受对战邀请 (核心对战房间建立) ---
+                elif m_type == "accept_invite":
+                    host_user = msg.get("from", "").strip()
+                    with online_lock:
+                        if host_user in online_players:
+                            # 相互绑定对手句柄
+                            # 告诉房主：对方接受了，进入游戏
+                            online_players[host_user].sendall((json.dumps({"type": "match_start", "opponent": my_username, "is_host": True}) + "\n").encode('utf-8'))
+                            # 告诉接受者：房间建立成功，进入游戏
+                            conn.sendall((json.dumps({"type": "match_start", "opponent": host_user, "is_host": False}) + "\n").encode('utf-8'))
+                        else:
+                            conn.sendall((json.dumps({"type": "toast", "msg": "邀请发起人已离开大厅"}) + "\n").encode('utf-8'))
+
+                # --- 7. 拒绝对战邀请 ---
+                elif m_type == "reject_invite":
+                    host_user = msg.get("from", "").strip()
+                    with online_lock:
+                        if host_user in online_players:
+                            online_players[host_user].sendall((json.dumps({"type": "toast", "msg": f"{my_username} 拒绝了你的对战邀请"}) + "\n").encode('utf-8'))
+
+                # --- 8. 实时对战数据高速转发转发通道 ---
+                elif m_type in ["game_data", "attack"]:
+                    target = msg.get("target", "").strip()
+                    with online_lock:
+                        if target in online_players:
+                            # 瘦身并原样转发
+                            conn_to_send = online_players[target]
+                            conn_to_send.sendall((line + "\n").encode('utf-8'))
+        except:
+            break
+
+    # 玩家断开连接清理
+    if my_username:
+        with online_lock:
+            if my_username in online_players:
+                del online_players[my_username]
+        print(f"❌ 玩家 {my_username} 已下线")
+        # 广播给好友
+        broadcast_status_to_friends(my_username, "offline")
     conn.close()
 
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
-    server.listen(2)
-    print(f"服务器已在端口 {PORT} 启动...")
-    conns = [None, None]
-    idx = 0
+    server.listen(100)
+    print(f"🚀 超级对战与好友大厅服务器已启动，正在端口 {PORT} 守候...")
     while True:
         c, addr = server.accept()
-        conns[idx] = c
-        threading.Thread(target=handle_client, args=(c, idx, conns), daemon=True).start()
-        idx = 1 - idx
+        threading.Thread(target=handle_client, args=(c, addr), daemon=True).start()
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
