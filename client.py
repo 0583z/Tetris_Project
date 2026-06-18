@@ -4,10 +4,17 @@ import socket
 import threading
 import json
 import os
+import sys
 
 try:
     pygame.mixer.pre_init(44100, -16, 2, 512)
 except: pass
+
+def resource_path(relative_path):
+    """获取资源文件的绝对路径，兼容 PyInstaller 打包"""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
 
 # --- 全局配置与暗黑科技风色盘 ---
 WIDTH, HEIGHT = 1000, 700 
@@ -37,18 +44,17 @@ lobby_data = {
 # --- 智能声效反馈引擎 ---
 class SoundController:
     def __init__(self):
-        self.base_path = os.path.dirname(os.path.abspath(__file__))
-        self.sounds = {}
-        sfx_map = {"move": "move.wav", "rotate": "rotate.wav", "drop": "drop.wav", 
+        sfx_map = {"move": "move.wav", "rotate": "rotate.wav", "drop": "drop.wav",
                    "clear": "clear.wav", "attack": "attack.wav", "over": "gameover.wav"}
+        self.sounds = {}
         for name, file in sfx_map.items():
-            p = os.path.join(self.base_path, "assets", file)
-            if os.path.exists(p): 
+            p = resource_path(os.path.join("assets", file))
+            if os.path.exists(p):
                 self.sounds[name] = pygame.mixer.Sound(p)
                 self.sounds[name].set_volume(0.4)
-        
-        self.bgm_normal = os.path.join(self.base_path, "assets", "resonance.wav")
-        self.bgm_fast = os.path.join(self.base_path, "assets", "fast_resonance.wav")
+
+        self.bgm_normal = resource_path(os.path.join("assets", "resonance.wav"))
+        self.bgm_fast = resource_path(os.path.join("assets", "fast_resonance.wav"))
         self.bgm_state, self.bgm_playing = "normal", False
         self.last_move_time = 0
 
@@ -379,10 +385,10 @@ def main():
                             input_add_friend = ""
                             
                     # 3. 实时循环遍历好友列表按钮（点击邀请）
-                    y_offset = 150
+                    y_offset = 200
                     for f_name, f_stat in list(lobby_data["friends"].items()):
                         if f_stat == "online":
-                            invite_btn = pygame.Rect(WIDTH - 230, y_offset - 2, 80, 32)
+                            invite_btn = pygame.Rect(WIDTH - 230, y_offset - 2, 120, 32)
                             if invite_btn.collidepoint(event.pos):
                                 pkg = json.dumps({"type": "invite_friend", "target": f_name}) + "\n"
                                 client_socket.sendall(pkg.encode('utf-8'))
