@@ -10,6 +10,7 @@ DB_FILE = 'server_accounts.json'
 # online_players 结构: { "用户名": socket_conn }
 online_players = {}
 online_lock = threading.Lock()
+db_lock = threading.Lock()
 
 def load_db():
     if os.path.exists(DB_FILE):
@@ -25,9 +26,10 @@ def save_db(data):
 
 def broadcast_status_to_friends(username, status):
     """通知所有在线好友该玩家的状态改变 (online / offline)"""
-    db = load_db()
-    if username in db:
-        friends = db[username].get("friends", [])
+    with db_lock:
+        db = load_db()
+        friends = list(db.get(username, {}).get("friends", []))
+    if friends:
         msg = json.dumps({"type": "friend_status", "username": username, "status": status}) + "\n"
         with online_lock:
             for f in friends:
@@ -57,35 +59,33 @@ def handle_client(conn, addr):
                     if not username:
                         conn.sendall((json.dumps({"type": "login_resp", "success": False, "reason": "用户名不能为空"}) + "\n").encode('utf-8'))
                         continue
-                    
-                    db = load_db()
-                    # 如果账号不存在则自动创建（极简无密码注册）
-                    if username not in db:
-                        db[username] = {"friends": [], "requests": []}
-                        save_db(db)
-                    
+
+                    with db_lock:
+                        db = load_db()
+                        # 如果账号不存在则自动创建（极简无密码注册）
+                        if username not in db:
+                            db[username] = {"friends": [], "requests": []}
+                            save_db(db)
+                        friends_list = list(db[username].get("friends", []))
+                        requests_list = list(db[username].get("requests", []))
+
                     with online_lock:
                         if username in online_players:
                             conn.sendall((json.dumps({"type": "login_resp", "success": False, "reason": "该账号已在别处登录"}) + "\n").encode('utf-8'))
                             continue
                         online_players[username] = conn
                         my_username = username
-                    
-                    # 组装初始化数据大礼包
-                    friends_list = db[username].get("friends", [])
-                    # 判定每个好友当前的在线状态
-                    with online_lock:
                         friends_status = {f: ("online" if f in online_players else "offline") for f in friends_list}
-                    
+
                     resp = {
                         "type": "login_resp",
                         "success": True,
                         "username": username,
                         "friends": friends_status,
-                        "requests": db[username].get("requests", [])
+                        "requests": requests_list
                     }
                     conn.sendall((json.dumps(resp) + "\n").encode('utf-8'))
-                    
+
                     # 广播给自己所有在线好友：我上线了
                     broadcast_status_to_friends(username, "online")
                 
@@ -95,64 +95,72 @@ def handle_client(conn, addr):
                     if target == my_username:
                         conn.sendall((json.dumps({"type": "toast", "msg": "不能添加自己为好友"}) + "\n").encode('utf-8'))
                         continue
-                    
-                    db = load_db()
-                    if target not in db:
-                        conn.sendall((json.dumps({"type": "toast", "msg": f"玩家 {target} 不存在"}) + "\n").encode('utf-8'))
-                        continue
-                    
-                    if target in db[my_username].get("friends", []):
-                        conn.sendall((json.dumps({"type": "toast", "msg": f"你们已经是好友了"}) + "\n").encode('utf-8'))
-                        continue
-                        
-                    if my_username in db[target].get("requests", []):
-                        conn.sendall((json.dumps({"type": "toast", "msg": "已发送过申请，请勿重复发送"}) + "\n").encode('utf-8'))
-                        continue
-                    
-                    # 存入目标用户的申请列表
-                    db[target]["requests"].append(my_username)
-                    save_db(db)
-                    
-                    conn.sendall((json.dumps({"type": "toast", "msg": "好友申请已发出"}) + "\n").encode('utf-8'))
-                    
-                    # 如果目标用户在线，实时推送申请通知
-                    with online_lock:
-                        if target in online_players:
-                            online_players[target].sendall((json.dumps({"type": "new_request", "from": my_username}) + "\n").encode('utf-8'))
+
+                    toast_msg = None
+                    with db_lock:
+                        db = load_db()
+                        if target not in db:
+                            toast_msg = f"玩家 {target} 不存在"
+                        elif target in db[my_username].get("friends", []):
+                            toast_msg = "你们已经是好友了"
+                        elif my_username in db[target].get("requests", []):
+                            toast_msg = "已发送过申请，请勿重复发送"
+                        else:
+                            # 存入目标用户的申请列表
+                            db[target]["requests"].append(my_username)
+                            save_db(db)
+                            toast_msg = "好友申请已发出"
+
+                    if toast_msg:
+                        conn.sendall((json.dumps({"type": "toast", "msg": toast_msg}) + "\n").encode('utf-8'))
+
+                    # 如果目标用户在线且申请成功，实时推送申请通知
+                    if toast_msg == "好友申请已发出":
+                        with online_lock:
+                            if target in online_players:
+                                online_players[target].sendall((json.dumps({"type": "new_request", "from": my_username}) + "\n").encode('utf-8'))
 
                 # --- 3. 同意好友申请 ---
                 elif m_type == "accept_friend":
                     from_user = msg.get("from", "").strip()
-                    db = load_db()
-                    
-                    if from_user in db[my_username].get("requests", []):
-                        db[my_username]["requests"].remove(from_user)
-                        
-                        if from_user not in db[my_username]["friends"]:
-                            db[my_username]["friends"].append(from_user)
-                        if my_username not in db[from_user]["friends"]:
-                            db[from_user]["friends"].append(my_username)
-                        save_db(db)
-                        
-                        # 给自己发回最新好友列表状态
+                    accepted = False
+                    my_requests = []
+                    with db_lock:
+                        db = load_db()
+                        if from_user in db[my_username].get("requests", []):
+                            db[my_username]["requests"].remove(from_user)
+                            if from_user not in db[my_username]["friends"]:
+                                db[my_username]["friends"].append(from_user)
+                            if my_username not in db[from_user]["friends"]:
+                                db[from_user]["friends"].append(my_username)
+                            save_db(db)
+                            accepted = True
+                            my_requests = list(db[my_username]["requests"])
+
+                    if accepted:
                         with online_lock:
                             my_status = "online" if my_username in online_players else "offline"
                             from_status = "online" if from_user in online_players else "offline"
-                            
-                            # 给自己同步
-                            conn.sendall((json.dumps({"type": "friend_added", "username": from_user, "status": from_status, "sync_requests": db[my_username]["requests"]}) + "\n").encode('utf-8'))
-                            # 给对方同步
+
+                            conn.sendall((json.dumps({"type": "friend_added", "username": from_user, "status": from_status, "sync_requests": my_requests}) + "\n").encode('utf-8'))
                             if from_user in online_players:
                                 online_players[from_user].sendall((json.dumps({"type": "friend_added", "username": my_username, "status": my_status}) + "\n").encode('utf-8'))
-                
+
                 # --- 4. 拒绝好友申请 ---
                 elif m_type == "reject_friend":
                     from_user = msg.get("from", "").strip()
-                    db = load_db()
-                    if from_user in db[my_username].get("requests", []):
-                        db[my_username]["requests"].remove(from_user)
-                        save_db(db)
-                        conn.sendall((json.dumps({"type": "sync_requests", "requests": db[my_username]["requests"]}) + "\n").encode('utf-8'))
+                    rejected = False
+                    my_requests = []
+                    with db_lock:
+                        db = load_db()
+                        if from_user in db[my_username].get("requests", []):
+                            db[my_username]["requests"].remove(from_user)
+                            save_db(db)
+                            rejected = True
+                            my_requests = list(db[my_username]["requests"])
+
+                    if rejected:
+                        conn.sendall((json.dumps({"type": "sync_requests", "requests": my_requests}) + "\n").encode('utf-8'))
 
                 # --- 5. 对战邀请路由系统 ---
                 elif m_type == "invite_friend":

@@ -25,7 +25,15 @@ GRID_COLOR = (50, 50, 60)
 BG_COLOR = (30, 30, 40)
 PANEL_BG = (40, 40, 52)
 FLASH_COLOR = (255, 255, 255)
-SHAPES = [[[1,1,1,1]], [[1,1],[1,1]], [[0,1,0],[1,1,1]], [[1,1,0],[0,1,1]], [[0,1,1],[1,1,0]]]
+SHAPES = [
+    [[1,1,1,1]],           # I
+    [[1,1],[1,1]],         # O
+    [[0,1,0],[1,1,1]],     # T
+    [[1,1,0],[0,1,1]],     # Z
+    [[0,1,1],[1,1,0]],     # S
+    [[1,0,0],[1,1,1]],     # L
+    [[0,0,1],[1,1,1]]      # J
+]
 
 # 客户端全局核心大厅状态机
 # 状态机空间: LOGIN(登录框), LOBBY(好友大厅), SINGLE(单人游玩), MULTI(好友跨屏对战)
@@ -190,6 +198,13 @@ class Tetris:
             new_row = [1] * COLUMNS
             new_row[random.randint(0, COLUMNS-1)] = 0
             self.grid.append(new_row)
+        # 网格整体上移后，检查当前方块是否与新网格碰撞；若碰撞则向上回退
+        while self.check_collision() and self.pos[0] > 0:
+            self.pos[0] -= 1
+        # 若回退后仍在顶部碰撞，则游戏结束
+        if self.check_collision():
+            self.game_over = True
+            if self.sfx: self.sfx.play("over")
         danger = any(self.grid[r][c] for r in range(5) for c in range(COLUMNS))
         if self.sfx: self.sfx.set_danger_bgm(danger)
 
